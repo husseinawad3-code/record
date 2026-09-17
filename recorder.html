@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>مسجّل الصوت الذكي</title>
+<style>
+  :root{
+    --bg:#F5F3EC; --card:#EBE8DF; --text:#1B1D21; --muted:#6C7079;
+    --track:#DCD8CC; --rec:#1E7A4C; --stop:#B23A2E; --line:#B23A2E; --border:#C8C4B8;
+  }
+  :root:not([data-theme="light"]){ @media (prefers-color-scheme: dark){
+    --bg:#15171A; --card:#20232A; --text:#F1F0EA; --muted:#9AA0AA;
+    --track:#2E323A; --border:#3A3F48;
+  }}
+  :root[data-theme="dark"]{
+    --bg:#15171A; --card:#20232A; --text:#F1F0EA; --muted:#9AA0AA;
+    --track:#2E323A; --border:#3A3F48;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif;
+       min-height:100vh;display:flex;flex-direction:column;padding:24px 20px calc(24px + env(safe-area-inset-bottom))}
+  .top{text-align:center;margin-top:12px}
+  .status{font-size:18px;font-weight:600;min-height:24px}
+  .time{font-size:64px;font-variant-numeric:tabular-nums;line-height:1.1;margin-top:6px}
+  .hint{font-size:13px;color:var(--muted);margin-top:6px;min-height:18px}
+  .meter{margin-top:28px}
+  .track{position:relative;height:14px;border-radius:7px;background:var(--track);overflow:visible}
+  .fill{height:100%;width:0;border-radius:7px;background:var(--muted);transition:width .05s linear}
+  .fill.on{background:var(--rec)}
+  .thr{position:absolute;top:-5px;width:3px;height:24px;background:var(--line);border-radius:2px;transform:translateX(50%)}
+  .labels{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-top:6px;font-variant-numeric:tabular-nums}
+  .row{display:flex;gap:10px;justify-content:center;margin-top:14px;flex-wrap:wrap}
+  .chip{padding:8px 14px;border-radius:20px;border:1px solid var(--border);background:transparent;color:var(--text);font-size:14px}
+  .center{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;min-height:240px}
+  .big{width:180px;height:180px;border-radius:50%;border:0;color:#fff;font-size:20px;font-weight:700;background:var(--rec);
+       -webkit-tap-highlight-color:transparent;transition:transform .08s}
+  .big:active{transform:scale(.97)}
+  .big.live{background:var(--stop)}
+  .list{display:flex;flex-direction:column;gap:10px}
+  .item{background:var(--card);border-radius:12px;padding:12px 14px}
+  .item .name{font-size:13px;color:var(--muted);margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .item audio{width:100%;height:36px}
+  .item .acts{display:flex;gap:8px;margin-top:8px}
+  .err{color:var(--stop);font-size:14px;text-align:center;margin-top:10px}
+</style>
+</head>
+<body>
+  <div class="top">
+    <div class="status" id="status">جاهز</div>
+    <div class="time" id="time">00:00</div>
+    <div class="hint">مدة الصوت المحفوظ فعليًا (بدون فترات الصمت)</div>
+  </div>
+
+  <div class="meter">
+    <div class="track">
+      <div class="fill" id="fill"></div>
+      <div class="thr" id="thr"></div>
+    </div>
+    <div class="labels"><span id="lvl">—</span><span>الحد: <span id="thrv">-45</span> dB</span></div>
+  </div>
+  <div class="row">
+    <button class="chip" id="more">أكثر حساسية</button>
+    <button class="chip" id="less">أقل حساسية</button>
+  </div>
+
+  <div class="center">
+    <button class="big" id="big">ابدأ التسجيل</button>
+    <div class="hint" id="sub"></div>
+    <div class="err" id="err"></div>
+  </div>
+
+  <div class="list" id="list"></div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const SILENCE_MS = 5000;   // مدة الصمت قبل الإيقاف المؤقت
+  let threshold = -45;       // dBFS
+  let stream, ctx, analyser, rec, raf, wake;
+  let live = false, gateOpen = false, lastVoice = 0;
+  let capturedMs = 0, segStart = 0, chunks = [], mime = "", ext = "";
+  let downloads = null;
+  if (window.claude && window.claude.use) claude.use("downloads").then(d => { downloads = d; }).catch(()=>{});
+
+  const fmt = ms => { const s = Math.floor(ms/1000); return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0"); };
+  const pct = db => Math.max(0, Math.min(1, (db+60)/60));
+  const drawThr = () => { $("thr").style.right = (pct(threshold)*100)+"%"; $("thrv").textContent = threshold; };
+  drawThr();
+  $("more").onclick = () => { threshold = Math.max(-70, threshold-2); drawThr(); };
+  $("less").onclick = () => { threshold = Math.min(-20, threshold+2); drawThr(); };
+
+  function pickMime(){
+    const c = ["audio/webm;codecs=opus","audio/webm","audio/mp4"];
+    for (const m of c) if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
+    return "";
+  }
+
+  function setStatus(t, sub){ $("status").textContent = t; $("sub").textContent = sub||""; }
+
+  async function start(){
+    $("err").textContent = "";
+    if (!window.MediaRecorder) { $("err").textContent = "المتصفح لا يدعم التسجيل. جرّب Chrome أو Safari."; return; }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true } });
+    } catch(e) {
+      $("err").textContent = "لم يُسمح باستخدام الميكروفون. افتح الصفحة في متصفح الهاتف واسمح بالإذن.";
+      return;
+    }
+    ctx = new (window.AudioContext||window.webkitAudioContext)();
+    const src = ctx.createMediaStreamSource(stream);
+    analyser = ctx.createAnalyser(); analyser.fftSize = 2048; src.connect(analyser);
+
+    mime = pickMime(); ext = mime.includes("mp4") ? "mp4" : "webm";
+    rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    chunks = []; capturedMs = 0; gateOpen = false;
+    rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+    rec.onstop = finish;
+    rec.start(1000);
+    rec.pause();                     // نبدأ متوقفين حتى يظهر الصوت
+    lastVoice = performance.now();
+    live = true;
+    $("big").textContent = "إيقاف وحفظ"; $("big").classList.add("live");
+    setStatus("متوقف مؤقتًا — في انتظار الصوت", "سيبدأ التسجيل تلقائيًا عندما تتكلم");
+    try { wake = await navigator.wakeLock?.request("screen"); } catch(_){}
+    loop();
+  }
+
+  const buf = new Float32Array(2048);
+  function loop(){
+    if (!live) return;
+    analyser.getFloatTimeDomainData(buf);
+    let s = 0; for (let i=0;i<buf.length;i++) s += buf[i]*buf[i];
+    const rms = Math.sqrt(s/buf.length);
+    const db = rms > 0 ? 20*Math.log10(rms) : -160;
+    const now = performance.now();
+    const voiced = db > threshold;
+    if (voiced) lastVoice = now;
+
+    if (!gateOpen && voiced) {
+      gateOpen = true; segStart = now;
+      if (rec.state === "paused") rec.resume();
+      setStatus("يسجّل", "");
+    } else if (gateOpen && !voiced && now - lastVoice >= SILENCE_MS) {
+      gateOpen = false;
+      capturedMs += now - segStart;
+      if (rec.state === "recording") rec.pause();
+      setStatus("متوقف مؤقتًا — في انتظار الصوت", "سيُستأنف التسجيل تلقائيًا عندما تتكلم");
+    }
+
+    const shown = gateOpen ? capturedMs + (now - segStart) : capturedMs;
+    $("time").textContent = fmt(shown);
+    $("fill").style.width = (pct(db)*100)+"%";
+    $("fill").classList.toggle("on", gateOpen);
+    $("lvl").textContent = db <= -100 ? "—" : db.toFixed(0)+" dB";
+    raf = requestAnimationFrame(loop);
+  }
+
+  function stop(){
+    live = false; cancelAnimationFrame(raf);
+    if (gateOpen) { capturedMs += performance.now() - segStart; gateOpen = false; }
+    if (rec.state === "paused") rec.resume();   // حتى يُغلق الملف بشكل سليم
+    rec.stop();
+    stream.getTracks().forEach(t => t.stop());
+    ctx.close(); wake?.release?.();
+    $("big").textContent = "ابدأ التسجيل"; $("big").classList.remove("live");
+    setStatus("جاهز", ""); $("fill").style.width = "0"; $("lvl").textContent = "—";
+  }
+
+  function finish(){
+    if (!chunks.length) { $("time").textContent = "00:00"; return; }
+    const blob = new Blob(chunks, { type: mime || "audio/webm" });
+    const name = "تسجيل-" + new Date().toLocaleString("sv-SE").replace(/[: ]/g,"-") + "." + ext;
+    const url = URL.createObjectURL(blob);
+
+    const item = document.createElement("div"); item.className = "item";
+    item.innerHTML = `<div class="name">${name} · ${fmt(capturedMs)}</div>
+      <audio controls src="${url}"></audio>
+      <div class="acts"><button class="chip">حفظ الملف</button><button class="chip">حذف</button></div>`;
+    const [save, del] = item.querySelectorAll("button");
+    save.onclick = async () => {
+      if (downloads) {
+        try { await downloads.save({ filename: name, data: blob }); }
+        catch(e) { if (e && e.code !== "declined") $("err").textContent = "تعذّر الحفظ: " + (e.message||e.code); }
+      } else {
+        const a = document.createElement("a"); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+      }
+    };
+    del.onclick = () => { URL.revokeObjectURL(url); item.remove(); };
+    $("list").prepend(item);
+    capturedMs = 0; chunks = [];
+  }
+
+  $("big").onclick = () => live ? stop() : start();
+})();
+</script>
+</body>
+</html>
